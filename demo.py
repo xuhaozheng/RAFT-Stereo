@@ -44,7 +44,8 @@ def demo(args):
             image1, image2 = padder.pad(image1, image2)
 
             _, flow_up = model(image1, image2, iters=args.valid_iters, test_mode=True)
-            file_stem = imfile1.split('/')[-2]
+            flow_up = padder.unpad(flow_up.float()).cpu().squeeze(0)
+            file_stem = imfile1.split('/')[-1][:-4]
             if args.save_numpy:
                 np.save(output_directory / f"{file_stem}.npy", flow_up.cpu().numpy().squeeze())
             plt.imsave(output_directory / f"{file_stem}.png", -flow_up.cpu().numpy().squeeze(), cmap='jet')
