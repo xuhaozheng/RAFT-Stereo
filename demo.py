@@ -54,7 +54,7 @@ def demo(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--restore_ckpt', help="restore checkpoint", required=True)
-    parser.add_argument('--save_numpy', action='store_true', help='save output as numpy arrays')
+    parser.add_argument('--save_numpy', action='store_true', default=True, help='save output as numpy arrays')
     parser.add_argument('-l', '--left_imgs', help="path to all first (left) frames", default="datasets/Middlebury/MiddEval3/testH/*/im0.png")
     parser.add_argument('-r', '--right_imgs', help="path to all second (right) frames", default="datasets/Middlebury/MiddEval3/testH/*/im1.png")
     parser.add_argument('--output_directory', help="directory to save output", default="demo_output")
