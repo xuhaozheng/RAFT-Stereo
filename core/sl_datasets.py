@@ -14,6 +14,8 @@ from pathlib import Path
 from glob import glob
 import os.path as osp
 from PIL import Image
+import torchvision
+from torchvision import transforms
 
 from core.utils import frame_utils
 from core.utils.augmentor import FlowAugmentor, SparseFlowAugmentor
@@ -62,39 +64,67 @@ class StereoDataset(data.Dataset):
             img_trans = img_trans / 255
         return img_trans
 
-    def structlight_reader(self, img_dir_R):
+    def preprocess_input(self, pil_img, scale): #(cls, pil_img, scale): 
+        w, h = pil_img.size
+        newW, newH = int(scale * w), int(scale * h)
+        assert newW > 0 and newH > 0, 'Scale is too small'
+        pil_img = pil_img.resize((newW, newH))
 
-        img_dir_R = self.img_files_R[i] + '/ambient_light/' + str(pose) + '_R.png'
-        img_file_R = glob(img_dir_R)
-        img_file_L = glob(img_dir_R.replace('_R', '_L'))
+        img_nd = np.array(pil_img)
+
+        if len(img_nd.shape) == 2:
+            img_nd = np.expand_dims(img_nd, axis=2)
+
+        # HWC to CHW
+        img_trans = img_nd#.transpose((2, 0, 1))
+
+
+        if self.data_mode == 'train':
+                tx = torchvision.transforms.Compose([
+                        torchvision.transforms.ToPILImage(),
+                        #torchvision.transforms.RandomRotation((-3,3)),
+                        torchvision.transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4),
+                        #torchvision.transforms.
+                ])
+        elif self.data_mode == 'valid':
+                tx = torchvision.transforms.Compose([
+                        torchvision.transforms.ToPILImage(),
+                ])
+        img_trans = np.array(tx(img_trans))
+        img_trans = img_nd.transpose((2, 0, 1))
+
+        if img_trans.max() > 1:
+            img_trans = img_trans / 255
+
+        return img_trans
+
+    def structlight_reader(self, scene_num, pose_num):
+        img_file_R = self.data_path + '{}/ambient_light/{}_R.png'.format(scene_num, pose_num)
+        img_file_L = self.data_path + '{}/ambient_light/{}_L.png'.format(scene_num, pose_num)
 
         mask_file_R = []
         mask_file_L = []
         for xx in range(9):
-            mask_dir_R = img_dir_R.replace('ambient_light','pattern_'+str(xx))
+            mask_dir_R = img_file_R.replace('ambient_light','pattern_'+str(xx))
             mask_file_R.append(glob(mask_dir_R.replace('_R', '_B_r')))
             mask_file_L.append(glob(mask_dir_R.replace('_R', '_B_l')))
         mask_file_R = np.array(mask_file_R)
         mask_file_L = np.array(mask_file_L)
 
-        assert len(img_file_R) == 1, \
-            f'no file found'
+        img_R = self.preprocess_input(Image.open(img_file_R), self.scale)#.convert('L'), self.scale)
+        img_L = self.preprocess_input(Image.open(img_file_L), self.scale)#.convert('L'), self.scale)
 
-
-        img_R = self.preprocess_input(Image.open(img_file_R[0]), self.scale)#.convert('L'), self.scale)
-        img_L = self.preprocess_input(Image.open(img_file_L[0]), self.scale)#.convert('L'), self.scale)
-
-        rr1=np.array(Image.open(img_dir_R.replace('ambient_light', 'three_phase').replace('_R', '_tp1_r'))) - np.array(Image.open(img_dir_R.replace('ambient_light', 'three_phase').replace('_R', '_tp2_r')))
-        rr2=np.array(Image.open(img_dir_R.replace('ambient_light', 'three_phase').replace('_R', '_tp1_r'))) - np.array(Image.open(img_dir_R.replace('ambient_light', 'three_phase').replace('_R', '_tp3_r')))
-        rr3=np.array(Image.open(img_dir_R.replace('ambient_light', 'three_phase').replace('_R', '_tp2_r'))) - np.array(Image.open(img_dir_R.replace('ambient_light', 'three_phase').replace('_R', '_tp3_r')))
+        rr1=np.array(Image.open(img_file_R.replace('ambient_light', 'three_phase').replace('_R', '_tp1_r'))) - np.array(Image.open(img_file_R.replace('ambient_light', 'three_phase').replace('_R', '_tp2_r')))
+        rr2=np.array(Image.open(img_file_R.replace('ambient_light', 'three_phase').replace('_R', '_tp1_r'))) - np.array(Image.open(img_file_R.replace('ambient_light', 'three_phase').replace('_R', '_tp3_r')))
+        rr3=np.array(Image.open(img_file_R.replace('ambient_light', 'three_phase').replace('_R', '_tp2_r'))) - np.array(Image.open(img_file_R.replace('ambient_light', 'three_phase').replace('_R', '_tp3_r')))
         modulation_right = (2 * np.sqrt(2) / 3) * np.sqrt(
                 (rr1) ** 2 +
                 (rr2) ** 2 +
                 (rr3) ** 2)
 
-        ll1=np.array(Image.open(img_dir_R.replace('ambient_light', 'three_phase').replace('_R', '_tp1_l'))) - np.array(Image.open(img_dir_R.replace('ambient_light', 'three_phase').replace('_R', '_tp2_l')))
-        ll2=np.array(Image.open(img_dir_R.replace('ambient_light', 'three_phase').replace('_R', '_tp1_l'))) - np.array(Image.open(img_dir_R.replace('ambient_light', 'three_phase').replace('_R', '_tp3_l')))
-        ll3=np.array(Image.open(img_dir_R.replace('ambient_light', 'three_phase').replace('_R', '_tp2_l'))) - np.array(Image.open(img_dir_R.replace('ambient_light', 'three_phase').replace('_R', '_tp3_l')))
+        ll1=np.array(Image.open(img_file_R.replace('ambient_light', 'three_phase').replace('_R', '_tp1_l'))) - np.array(Image.open(img_file_R.replace('ambient_light', 'three_phase').replace('_R', '_tp2_l')))
+        ll2=np.array(Image.open(img_file_R.replace('ambient_light', 'three_phase').replace('_R', '_tp1_l'))) - np.array(Image.open(img_file_R.replace('ambient_light', 'three_phase').replace('_R', '_tp3_l')))
+        ll3=np.array(Image.open(img_file_R.replace('ambient_light', 'three_phase').replace('_R', '_tp2_l'))) - np.array(Image.open(img_file_R.replace('ambient_light', 'three_phase').replace('_R', '_tp3_l')))
         modulation_left = (2 * np.sqrt(2) / 3) * np.sqrt(
                 (ll1) ** 2 +
                 (ll2) ** 2 +
@@ -121,30 +151,23 @@ class StereoDataset(data.Dataset):
         return img_L, img_R, mask
     
     def __getitem__(self, index):
-        if not self.init_seed:
-            worker_info = torch.utils.data.get_worker_info()
-            if worker_info is not None:
-                torch.manual_seed(worker_info.id)
-                np.random.seed(worker_info.id)
-                random.seed(worker_info.id)
-                self.init_seed = True
+        # if not self.init_seed:
+        #     worker_info = torch.utils.data.get_worker_info()
+        #     if worker_info is not None:
+        #         torch.manual_seed(worker_info.id)
+        #         np.random.seed(worker_info.id)
+        #         random.seed(worker_info.id)
+        #         self.init_seed = True
 
-        index = index % len(self.image_list)
-        # disp = self.disparity_reader(self.disparity_list[index])
-        img1, img2, disp = self.structlight_reader(self.imgR_list[index])
-        if isinstance(disp, tuple):
-            disp, valid = disp
-        else:
-            valid = disp < 512
+        result = self.imgR_list[index].split('/')
+        scene_num = result[-3]
+        pose_num = result[-1][:-6]
 
-        # img1 = frame_utils.read_gen(self.image_list[index][0])
-        # img2 = frame_utils.read_gen(self.image_list[index][1])
+        img1, img2, disp = self.structlight_reader(scene_num, pose_num)
 
         img1 = np.array(img1).astype(np.uint8)
         img2 = np.array(img2).astype(np.uint8)
-
         disp = np.array(disp).astype(np.float32)
-        flow = np.stack([-disp, np.zeros_like(disp)], axis=-1)
 
         # grayscale images
         if len(img1.shape) == 2:
@@ -154,75 +177,36 @@ class StereoDataset(data.Dataset):
             img1 = img1[..., :3]
             img2 = img2[..., :3]
 
-        if self.augmentor is not None:
-            if self.sparse:
-                img1, img2, flow, valid = self.augmentor(img1, img2, flow, valid)
-            else:
-                img1, img2, flow = self.augmentor(img1, img2, flow)
-
-        img1 = torch.from_numpy(img1).permute(2, 0, 1).float()
-        img2 = torch.from_numpy(img2).permute(2, 0, 1).float()
-        flow = torch.from_numpy(flow).permute(2, 0, 1).float()
-
-        if self.sparse:
-            valid = torch.from_numpy(valid)
-        else:
-            valid = (flow[0].abs() < 512) & (flow[1].abs() < 512)
-
         if self.img_pad is not None:
             padH, padW = self.img_pad
             img1 = F.pad(img1, [padW]*2 + [padH]*2)
             img2 = F.pad(img2, [padW]*2 + [padH]*2)
 
-        flow = flow[:1]
-        return self.image_list[index] + [self.disparity_list[index]], img1, img2, flow, valid.float()
+        return img1, img2, disp
 
-
-    def __mul__(self, v):
-        copy_of_self = copy.deepcopy(self)
-        copy_of_self.flow_list = v * copy_of_self.flow_list
-        copy_of_self.image_list = v * copy_of_self.image_list
-        copy_of_self.disparity_list = v * copy_of_self.disparity_list
-        copy_of_self.extra_info = v * copy_of_self.extra_info
-        return copy_of_self
+    ### From original code to duplicate the class attribute
+    # def __mul__(self, v):
+    #     copy_of_self = copy.deepcopy(self)
+    #     copy_of_self.flow_list = v * copy_of_self.flow_list
+    #     copy_of_self.image_list = v * copy_of_self.image_list
+    #     copy_of_self.disparity_list = v * copy_of_self.disparity_list
+    #     copy_of_self.extra_info = v * copy_of_self.extra_info
+    #     return copy_of_self
         
     def __len__(self):
         return len(self.image_list)
 
 
 class StructLight(StereoDataset):
-    def __init__(self, aug_params=None, root='datasets/SL', split='training'):
+    def __init__(self, aug_params=None, data_path='/home/terryxu/Downloads/hx/', split='training'):
         super(StructLight, self).__init__(aug_params, sparse=True)
 
-        with open(os.path.join('SL', 'img_r_list.txt'), 'r') as f:
-            # filenames = sorted(f.read().splitlines())
+        with open(os.path.join('SL', 'img_r_list_full.txt'), 'r') as f:
             lines = f.readlines()
         self.imgR_list = lines
-        # image1_list = sorted( glob(osp.join(root, f'two_view_{split}/*/im0.png')) )
-        # image2_list = sorted( glob(osp.join(root, f'two_view_{split}/*/im1.png')) )
-        # disp_list = sorted( glob(osp.join(root, 'two_view_training_gt/*/disp0GT.pfm')) ) if split == 'training' else [osp.join(root, 'two_view_training_gt/playground_1l/disp0GT.pfm')]*len(image1_list)
-
-        # for img1, img2, disp in zip(image1_list, image2_list, disp_list):
-        #     self.image_list += [ [img1, img2] ]
-        #     self.disparity_list += [ disp ]
-
-
-class KITTI(StereoDataset):
-    def __init__(self, aug_params=None, root='datasets/KITTI', image_set='training'):
-        super(KITTI, self).__init__(aug_params, sparse=True, reader=frame_utils.readDispKITTI)
-        assert os.path.exists(root)
-
-        image1_list = sorted(glob(os.path.join(root, image_set, 'image_2/*_10.png')))
-        image2_list = sorted(glob(os.path.join(root, image_set, 'image_3/*_10.png')))
-        disp_list = sorted(glob(os.path.join(root, 'training', 'disp_occ_0/*_10.png'))) if image_set == 'training' else [osp.join(root, 'training/disp_occ_0/000085_10.png')]*len(image1_list)
-
-        for idx, (img1, img2, disp) in enumerate(zip(image1_list, image2_list, disp_list)):
-            self.image_list += [ [img1, img2] ]
-            self.disparity_list += [ disp ]
-
-
-
-
+        self.data_path = data_path
+        scale = 1/2
+        self.scale = scale
   
 def fetch_dataloader(args):
     """ Create the data loader for the corresponding trainign set """
@@ -235,13 +219,14 @@ def fetch_dataloader(args):
     if hasattr(args, "do_flip") and args.do_flip is not None:
         aug_params["do_flip"] = args.do_flip
 
-    new_dataset = StructLight(aug_params, keywords=dataset_name.split('_')[2:])
+    new_dataset = StructLight(aug_params)
     logging.info(f"Adding {len(new_dataset)} samples from Alister's Dataset")
-    train_dataset = new_dataset if train_dataset is None else train_dataset + new_dataset
+    train_dataset = new_dataset
+    return train_dataset
 
-    train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, 
-        pin_memory=True, shuffle=True, num_workers=int(os.environ.get('SLURM_CPUS_PER_TASK', 6))-2, drop_last=True)
+    # train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, 
+    #     pin_memory=True, shuffle=True, num_workers=int(os.environ.get('SLURM_CPUS_PER_TASK', 6))-2, drop_last=True)
 
-    logging.info('Training with %d image pairs' % len(train_dataset))
-    return train_loader
+    # logging.info('Training with %d image pairs' % len(train_dataset))
+    # return train_loader
 
