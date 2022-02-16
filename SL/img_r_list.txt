@@ -1,0 +1,1 @@
+/media/patterson_sl_data/patterson_dataset/train/1/ambient_light/0_R.png
