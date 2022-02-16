@@ -1,62 +1,142 @@
-#test
+from __future__ import print_function, division
+
 import argparse
 import logging
-import os
-import sys
-
 import numpy as np
-import torch
-import torch.nn as nn
-from torch import optim
+from pathlib import Path
 from tqdm import tqdm
 
-from eval import eval_net
-from unet import UNet
-
 from torch.utils.tensorboard import SummaryWriter
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from core.raft_stereo import RAFTStereo
+
+from evaluate_stereo import *
+import core.stereo_datasets as datasets
 from utils.dataset import BasicDataset
 from torch.utils.data import DataLoader, random_split
-import torch.nn.functional as F
 
-import matplotlib.pyplot as plt
-
-dir_checkpoint = 'checkpoints/'
-
-def apply_disparity(img, disp):
-    """
-    img = [b,18,h,w]
-    disp = [b,h,w]
-    """
-    batch_size, _, height, width = img.size()
-
-    # Original coordinates of pixels
-    x_base = torch.linspace(0, 1, width).repeat(batch_size,
-                height, 1).type_as(img)
-    y_base = torch.linspace(0, 1, height).repeat(batch_size,
-                width, 1).transpose(1, 2).type_as(img)
-
-    # Apply shift in X direction
-    x_shifts = disp  # Disparity is passed in NCHW format with 1 channel
-    flow_field = torch.stack((x_base + x_shifts, y_base), dim=3)
-    # In grid_sample coordinates are assumed to be between -1 and 1
-    output = F.grid_sample(img, 2*flow_field - 1, mode='bilinear',
-                           padding_mode='zeros')
-
-    return output
-
-def train_net(net,
-              device,
-              epochs=100,
-              batch_size=20,
-              lr=0.001,
-              val_percent=0.0,
-              save_cp=True,
-              img_scale=1.0):
-
-    torch.cuda.empty_cache() 
+try:
+    from torch.cuda.amp import GradScaler
+except:
+    # dummy GradScaler for PyTorch < 1.6
+    class GradScaler:
+        def __init__(self):
+            pass
+        def scale(self, loss):
+            return loss
+        def unscale_(self, optimizer):
+            pass
+        def step(self, optimizer):
+            optimizer.step()
+        def update(self):
+            pass
 
 
+def sequence_loss(flow_preds, flow_gt, valid, loss_gamma=0.9, max_flow=700):
+    """ Loss function defined over sequence of flow predictions """
 
+    n_predictions = len(flow_preds)
+    assert n_predictions >= 1
+    flow_loss = 0.0
+
+    # exlude invalid pixels and extremely large diplacements
+    mag = torch.sum(flow_gt**2, dim=1).sqrt()
+
+    # exclude extremly large displacements
+    valid = ((valid >= 0.5) & (mag < max_flow)).unsqueeze(1)
+    assert valid.shape == flow_gt.shape, [valid.shape, flow_gt.shape]
+    assert not torch.isinf(flow_gt[valid.bool()]).any()
+
+    for i in range(n_predictions):
+        assert not torch.isnan(flow_preds[i]).any() and not torch.isinf(flow_preds[i]).any()
+        # We adjust the loss_gamma so it is consistent for any number of RAFT-Stereo iterations
+        adjusted_loss_gamma = loss_gamma**(15/(n_predictions - 1))
+        i_weight = adjusted_loss_gamma**(n_predictions - i - 1)
+        i_loss = (flow_preds[i] - flow_gt).abs()
+        assert i_loss.shape == valid.shape, [i_loss.shape, valid.shape, flow_gt.shape, flow_preds[i].shape]
+        flow_loss += i_weight * i_loss[valid.bool()].mean()
+
+    epe = torch.sum((flow_preds[-1] - flow_gt)**2, dim=1).sqrt()
+    epe = epe.view(-1)[valid.view(-1)]
+
+    metrics = {
+        'epe': epe.mean().item(),
+        '1px': (epe < 1).float().mean().item(),
+        '3px': (epe < 3).float().mean().item(),
+        '5px': (epe < 5).float().mean().item(),
+    }
+
+    return flow_loss, metrics
+
+
+def fetch_optimizer(args, model):
+    """ Create the optimizer and learning rate scheduler """
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wdecay, eps=1e-8)
+
+    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, args.lr, args.num_steps+100,
+            pct_start=0.01, cycle_momentum=False, anneal_strategy='linear')
+
+    return optimizer, scheduler
+
+
+class Logger:
+
+    SUM_FREQ = 100
+
+    def __init__(self, model, scheduler):
+        self.model = model
+        self.scheduler = scheduler
+        self.total_steps = 0
+        self.running_loss = {}
+        self.writer = SummaryWriter(log_dir='runs')
+
+    def _print_training_status(self):
+        metrics_data = [self.running_loss[k]/Logger.SUM_FREQ for k in sorted(self.running_loss.keys())]
+        training_str = "[{:6d}, {:10.7f}] ".format(self.total_steps+1, self.scheduler.get_last_lr()[0])
+        metrics_str = ("{:10.4f}, "*len(metrics_data)).format(*metrics_data)
+        
+        # print the training status
+        logging.info(f"Training Metrics ({self.total_steps}): {training_str + metrics_str}")
+
+        if self.writer is None:
+            self.writer = SummaryWriter(log_dir='runs')
+
+        for k in self.running_loss:
+            self.writer.add_scalar(k, self.running_loss[k]/Logger.SUM_FREQ, self.total_steps)
+            self.running_loss[k] = 0.0
+
+    def push(self, metrics):
+        self.total_steps += 1
+
+        for key in metrics:
+            if key not in self.running_loss:
+                self.running_loss[key] = 0.0
+
+            self.running_loss[key] += metrics[key]
+
+        if self.total_steps % Logger.SUM_FREQ == Logger.SUM_FREQ-1:
+            self._print_training_status()
+            self.running_loss = {}
+
+    def write_dict(self, results):
+        if self.writer is None:
+            self.writer = SummaryWriter(log_dir='runs')
+
+        for key in results:
+            self.writer.add_scalar(key, results[key], self.total_steps)
+
+    def close(self):
+        self.writer.close()
+
+
+def train(args):
+
+    model = nn.DataParallel(RAFTStereo(args))
+    print("Parameter Count: %d" % count_parameters(model))
+
+    ### Alister's DataLoader
     dataset = BasicDataset('/media/patterson_sl_data/patterson_dataset/train', img_scale, mode='show_room')
     n_val = int(len(dataset) * val_percent)
     n_train = len(dataset) - n_val
@@ -65,188 +145,126 @@ def train_net(net,
     val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True, drop_last=True)
 
 
-    writer = SummaryWriter(comment=f'LR_{lr}_BS_{batch_size}_SCALE_{img_scale}')
-    global_step = 0
+    ### RAFT DataLoader
+    train_loader = datasets.fetch_dataloader(args)
+    optimizer, scheduler = fetch_optimizer(args, model)
+    total_steps = 0
+    logger = Logger(model, scheduler)
 
-    logging.info(f'''Starting training:
-        Epochs:          {epochs}
-        Batch size:      {batch_size}
-        Learning rate:   {lr}
-        Training size:   {n_train}
-        Validation size: {n_val}
-        Checkpoints:     {save_cp}
-        Device:          {device.type}
-        Images scaling:  {img_scale}
-    ''')
+    if args.restore_ckpt is not None:
+        assert args.restore_ckpt.endswith(".pth")
+        logging.info("Loading checkpoint...")
+        checkpoint = torch.load(args.restore_ckpt)
+        model.load_state_dict(checkpoint, strict=True)
+        logging.info(f"Done loading checkpoint")
 
-    optimizer = optim.Adam(net.parameters(), lr=lr) # they used rms w/ momentum 0.9, weight_decay=1e-8
-    #scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=2)
+    model.cuda()
+    model.train()
+    model.module.freeze_bn() # We keep BatchNorm frozen
 
-    criterion = nn.BCELoss(reduction='none')
-    warped_criterion = nn.BCELoss(reduction='none')
-    gd = nn.MSELoss()
+    validation_frequency = 10000
 
-    full_steps = int(n_train/batch_size) # total number of steps
-    print_step = int(int(full_steps*0.8))
-    vali_step = int(int(full_steps*0.8))
+    scaler = GradScaler(enabled=args.mixed_precision)
 
-    www = (torch.tensor([[[0., 0., 0.],
-                    [-1.,0.,1.],
-                    [0., 0., 0.]]], dtype=torch.float32, requires_grad=False) + 1e-9).repeat(9, 1, 1)
+    should_keep_training = True
+    global_batch_num = 0
+    while should_keep_training:
 
-    grad_k = www.view(1, 9, 3, 3).to(device=device, dtype=torch.float32)
+        for i_batch, (_, *data_blob) in enumerate(tqdm(train_loader)):
+            optimizer.zero_grad()
+            image1, image2, flow, valid = [x.cuda() for x in data_blob]
 
-    for epoch in range(epochs):
-        net.train()
+            assert model.training
+            flow_predictions = model(image1, image2, iters=args.train_iters)
+            assert model.training
 
-        epoch_loss = 0
-        with tqdm(total=n_train, desc=f'Epoch {epoch + 1}/{epochs}', unit='img') as pbar:
-            dataset.data_mode = 'train'
-            for batch in train_loader:
-                imgs = batch['image'].to(device=device, dtype=torch.float32)
-                true_masks = batch['mask'].to(device=device, dtype=torch.float32)
-                disparity = batch['disparity'].to(device=device, dtype=torch.float32)
-                depth_mask = batch['depth_mask'].to(device=device, dtype=torch.float32)
-                assert imgs.shape[1] == net.n_channels, \
-                    f'Network has been defined with {net.n_channels} input channels, ' \
-                    f'but loaded images have {imgs.shape[1]} channels. Please check that ' \
-                    'the images are loaded correctly.'
+            loss, metrics = sequence_loss(flow_predictions, flow, valid)
+            logger.writer.add_scalar("live_loss", loss.item(), global_batch_num)
+            logger.writer.add_scalar(f'learning_rate', optimizer.param_groups[0]['lr'], global_batch_num)
+            global_batch_num += 1
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
+            scaler.step(optimizer)
+            scheduler.step()
+            scaler.update()
 
-                # graph run
-                masks_pred = net(imgs)
+            logger.push(metrics)
 
-                sig_loss = torch.mean(criterion(masks_pred, true_masks))
+            if total_steps % validation_frequency == validation_frequency - 1:
+                save_path = Path('checkpoints/%d_%s.pth' % (total_steps + 1, args.name))
+                logging.info(f"Saving file {save_path.absolute()}")
+                torch.save(model.state_dict(), save_path)
 
-		# Creating the derivative loss
-                binaryPredR = masks_pred[:,:9]
-                binaryPredL = masks_pred[:,9:]
-                truePredR = true_masks[:,:9]
-                truePredL = true_masks[:,9:]
-                truePredL_grads = torch.nn.functional.conv2d(truePredL, grad_k, padding=(1,1))
-                truePredR_grads = torch.nn.functional.conv2d(truePredR, grad_k, padding=(1,1))
-                truePredFull_grads = torch.cat((truePredR_grads,truePredL_grads),1)
-                binaryPredL_grads = torch.nn.functional.conv2d(binaryPredL, grad_k, padding=(1,1))
-                binaryPredR_grads = torch.nn.functional.conv2d(binaryPredR, grad_k, padding=(1,1))
-                binaryPredFull_grads = torch.cat((binaryPredR_grads,binaryPredL_grads),1)
+                results = validate_things(model.module, iters=args.valid_iters)
 
+                logger.write_dict(results)
 
-                warped_left_sl = apply_disparity(binaryPredR, disparity[:,0])
-                warped_right_sl = apply_disparity(binaryPredL, disparity[:,1])
-                warped_sl = torch.cat((warped_right_sl, warped_left_sl),1)
-                warped_sig_loss = torch.mean(warped_criterion(warped_sl*depth_mask, true_masks*depth_mask))/40.
+                model.train()
+                model.module.freeze_bn()
 
-                grad_loss = gd(truePredFull_grads,binaryPredFull_grads)/80.
+            total_steps += 1
 
+            if total_steps > args.num_steps:
+                should_keep_training = False
+                break
 
-                #loss = sig_loss + grad_loss + warped_sig_loss
-                loss = sig_loss + grad_loss
-                #loss = warped_sig_loss
+        if len(train_loader) >= 10000:
+            save_path = Path('checkpoints/%d_epoch_%s.pth.gz' % (total_steps + 1, args.name))
+            logging.info(f"Saving file {save_path}")
+            torch.save(model.state_dict(), save_path)
 
+    print("FINISHED TRAINING")
+    logger.close()
+    PATH = 'checkpoints/%s.pth' % args.name
+    torch.save(model.state_dict(), PATH)
 
-                epoch_loss += loss.item()
-                writer.add_scalar('Loss/train_gd', grad_loss, global_step)
-                writer.add_scalar('Loss/train_sig', sig_loss, global_step)
-                writer.add_scalar('Loss/train_warped_sig', warped_sig_loss, global_step)
-                writer.add_scalar('Loss/train', loss, global_step)
-
-                pbar.set_postfix(**{'loss (batch)': loss.item()})
-
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_value_(net.parameters(), 0.1)
-                optimizer.step()
-
-                pbar.update(imgs.shape[0])
-
-                full_steps = int(n_train/batch_size) # total number of steps
-                global_step += 1
-                if global_step % print_step == 0: # print loss every 10%
-                    print('Sample Loss: ', loss.item())
-                if global_step % vali_step == 0: # vali every half epoch
-                    print('Validation')
-                    for tag, value in net.named_parameters():
-                        tag = tag.replace('.', '/')
-                        writer.add_histogram('weights/' + tag, value.data.cpu().numpy(), global_step)
-                        writer.add_histogram('grads/' + tag, value.grad.data.cpu().numpy(), global_step)
-                    dataset.data_mode = 'valid'
-                    val_score = eval_net(net, val_loader, device, writer, global_step)
-                    dataset.data_mode = 'train'
-                    #scheduler.step(val_score)
-                    writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], global_step)
-
-
-                    logging.info('Validation Dice Coeff: {}'.format(val_score))
-
-
-
-        if save_cp and epoch % 20 == 0:
-            try:
-                os.mkdir(dir_checkpoint)
-                logging.info('Created checkpoint directory')
-            except OSError:
-                pass
-            torch.save(net.state_dict(),
-                       dir_checkpoint + f'CP_epoch{epoch + 1}.pth')
-            logging.info(f'Checkpoint {epoch + 1} saved !')
-
-    writer.close()
-
-
-def get_args():
-    parser = argparse.ArgumentParser(description='Train the UNet on images and target masks',
-                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('-e', '--epochs', metavar='E', type=int, default=1000,
-                        help='Number of epochs', dest='epochs')
-    parser.add_argument('-b', '--batch-size', metavar='B', type=int, nargs='?', default=4,
-                        help='Batch size', dest='batchsize')
-    parser.add_argument('-l', '--learning-rate', metavar='LR', type=float, nargs='?', default=1e-4,
-                        help='Learning rate', dest='lr')
-    parser.add_argument('-f', '--load', dest='load', type=str, default=False,
-                        help='Load model from a .pth file')
-    parser.add_argument('-s', '--scale', dest='scale', type=float, default=0.5,
-                        help='Downscaling factor of the images')
-    parser.add_argument('-v', '--validation', dest='val', type=float, default=50.0,
-                        help='Percent of the data that is used as validation (0-100)')
-    parser.add_argument('-ic', '--inputchannels', type=int, default=6,
-                        help='input channel stuff')
-
-    return parser.parse_args()
+    return PATH
 
 
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-    args = get_args()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logging.info(f'Using device {device}')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--name', default='raft-stereo', help="name your experiment")
+    parser.add_argument('--restore_ckpt', help="restore checkpoint")
+    parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
 
-    net = UNet(n_channels=args.inputchannels)    # THIS VARIES THE INPUT CHANNEL LEN, MUST ALWAYS REMEMBER THIS, SHOULD ADD AS ARGPARSE
-    logging.info(f'Network:\n'
-                 f'\t{net.n_channels} input channels\n')
-                 #f'\t{"Bilinear" if net.bilinear else "Transposed conv"} upscaling')
+    # Training parameters
+    parser.add_argument('--batch_size', type=int, default=6, help="batch size used during training.")
+    parser.add_argument('--train_datasets', nargs='+', default=['sceneflow'], help="training datasets.")
+    parser.add_argument('--lr', type=float, default=0.0002, help="max learning rate.")
+    parser.add_argument('--num_steps', type=int, default=100000, help="length of training schedule.")
+    parser.add_argument('--image_size', type=int, nargs='+', default=[320, 720], help="size of the random image crops used during training.")
+    parser.add_argument('--train_iters', type=int, default=16, help="number of updates to the disparity field in each forward pass.")
+    parser.add_argument('--wdecay', type=float, default=.00001, help="Weight decay in optimizer.")
 
-    if args.load:
-        net.load_state_dict(
-            torch.load(args.load, map_location=device)
-        )
-        logging.info(f'Model loaded from {args.load}')
+    # Validation parameters
+    parser.add_argument('--valid_iters', type=int, default=32, help='number of flow-field updates during validation forward pass')
 
-    net.to(device=device)
-    # faster convolutions, but more memory
-    # cudnn.benchmark = True
+    # Architecure choices
+    parser.add_argument('--corr_implementation', choices=["reg", "alt", "reg_cuda", "alt_cuda"], default="reg", help="correlation volume implementation")
+    parser.add_argument('--shared_backbone', action='store_true', help="use a single backbone for the context and feature encoders")
+    parser.add_argument('--corr_levels', type=int, default=4, help="number of levels in the correlation pyramid")
+    parser.add_argument('--corr_radius', type=int, default=4, help="width of the correlation pyramid")
+    parser.add_argument('--n_downsample', type=int, default=2, help="resolution of the disparity field (1/2^K)")
+    parser.add_argument('--slow_fast_gru', action='store_true', help="iterate the low-res GRUs more frequently")
+    parser.add_argument('--n_gru_layers', type=int, default=3, help="number of hidden GRU levels")
+    parser.add_argument('--hidden_dims', nargs='+', type=int, default=[128]*3, help="hidden state and context dimensions")
 
-    try:
-        train_net(net=net,
-                  epochs=args.epochs,
-                  batch_size=args.batchsize,
-                  lr=args.lr,
-                  device=device,
-                  img_scale=args.scale,
-                  val_percent=args.val / 100)
-    except KeyboardInterrupt:
-        torch.save(net.state_dict(), 'INTERRUPTED.pth')
-        logging.info('Saved interrupt')
-        try:
-            sys.exit(0)
-        except SystemExit:
-            os._exit(0)
+    # Data augmentation
+    parser.add_argument('--img_gamma', type=float, nargs='+', default=None, help="gamma range")
+    parser.add_argument('--saturation_range', type=float, nargs='+', default=None, help='color saturation')
+    parser.add_argument('--do_flip', default=False, choices=['h', 'v'], help='flip the images horizontally or vertically')
+    parser.add_argument('--spatial_scale', type=float, nargs='+', default=[0, 0], help='re-scale the images randomly')
+    parser.add_argument('--noyjitter', action='store_true', help='don\'t simulate imperfect rectification')
+    args = parser.parse_args()
+
+    torch.manual_seed(1234)
+    np.random.seed(1234)
+    
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s')
+
+    Path("checkpoints").mkdir(exist_ok=True, parents=True)
+
+    train(args)
