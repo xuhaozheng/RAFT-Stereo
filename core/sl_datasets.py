@@ -1,5 +1,6 @@
 # Data loading based on https://github.com/NVIDIA/flownet2-pytorch
 
+from ast import Return
 import numpy as np
 import torch
 import torch.utils.data as data
@@ -42,7 +43,9 @@ class StereoDataset(data.Dataset):
         self.disparity_list = []
         self.image_list = []
         self.extra_info = []
-        self.data_mode = 'train'
+
+
+        self.data_mode = 'train'    ###from Alistair's code
 
     def preprocess(self, pil_img, scale): #(cls, pil_img, scale): 
 
@@ -222,7 +225,8 @@ def fetch_dataloader(args):
     new_dataset = StructLight(aug_params)
     logging.info(f"Adding {len(new_dataset)} samples from Alister's Dataset")
     train_dataset = new_dataset
-    
+    # return train_dataset  ###for test dataset
+
     train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, 
         pin_memory=True, shuffle=True, num_workers=int(os.environ.get('SLURM_CPUS_PER_TASK', 6))-2, drop_last=True)
 

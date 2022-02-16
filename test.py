@@ -3,20 +3,8 @@ from __future__ import print_function, division
 import argparse
 import logging
 import numpy as np
-# from pathlib import Path
-# from tqdm import tqdm
 
-# from torch.utils.tensorboard import SummaryWriter
-# import torch
-# import torch.nn as nn
-# import torch.optim as optim
-# from core.raft_stereo import RAFTStereo
-
-# from evaluate_stereo import *
-# import core.stereo_datasets as datasets
 import core.sl_datasets as datasets
-# from utils.dataset import BasicDataset
-# from torch.utils.data import DataLoader, random_split
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--name', default='raft-stereo', help="name your experiment")
@@ -52,9 +40,6 @@ parser.add_argument('--do_flip', default=False, choices=['h', 'v'], help='flip t
 parser.add_argument('--spatial_scale', type=float, nargs='+', default=[0, 0], help='re-scale the images randomly')
 parser.add_argument('--noyjitter', action='store_true', help='don\'t simulate imperfect rectification')
 args = parser.parse_args()
-
-# torch.manual_seed(1234)
-# np.random.seed(1234)
 
 train_loader = datasets.fetch_dataloader(args)
 # train_loader.__getitem__(0)
